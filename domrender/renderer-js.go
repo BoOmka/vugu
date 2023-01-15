@@ -22,16 +22,17 @@ import (
 //
 // Deprecated: Use New instead.
 func NewJSRenderer(mountPointSelector string) (*JSRenderer, error) {
-	return New(mountPointSelector)
+	return New(mountPointSelector, false)
 }
 
 // New will create a new JSRenderer with the speicifc mount point selector.
 // If an empty string is passed then the root component should include a top level <html> tag
 // and the entire page will be rendered.
-func New(mountPointSelector string) (*JSRenderer, error) {
+func New(mountPointSelector string, skipCSS bool) (*JSRenderer, error) {
 
 	ret := &JSRenderer{
 		MountPointSelector: mountPointSelector,
+		SkipCSS:            skipCSS,
 	}
 
 	ret.instructionBuffer = make([]byte, 16384)
@@ -120,6 +121,7 @@ func newJsRenderState() *jsRenderState {
 // JSRenderer implements Renderer against the browser's DOM.
 type JSRenderer struct {
 	MountPointSelector string
+	SkipCSS            bool
 
 	eventWaitCh chan bool          // events send to this and EventWait receives from it
 	eventRWMU   sync.RWMutex       // make sure Render and event handling are not attempted at the same time (not totally sure if this is necessary in terms of the wasm threading model but enforce it with a rwmutex all the same)
@@ -190,8 +192,60 @@ func (r *JSRenderer) render(buildResults *vugu.BuildResults) error {
 
 	// TODO: move this next chunk out to it's own func at least
 
+	// CSS stuff first
+	if !r.SkipCSS {
+		if err := r.cleanupCSS(bo, buildResults); err != nil {
+			return err
+		}
+	}
+
+	// main output
+	if err := r.visitFirst(state, bo, buildResults, bo.Out[0], []byte("0")); err != nil {
+		return err
+	}
+
+	// // JS stuff last
+	// // log.Printf("TODO: handle JS")
+
+	if err := r.instructionList.flush(); err != nil {
+		return err
+	}
+
+	// handle Rendered lifecycle callback
+	if r.lifecycleStateMap == nil {
+		r.lifecycleStateMap = make(map[interface{}]lifecycleState, len(bo.Components))
+	}
+	r.lifecyclePassNum++
+
+	var rctx renderedCtx
+
+	for _, c := range bo.Components {
+
+		rctx = renderedCtx{eventEnv: r.eventEnv}
+
+		st, ok := r.lifecycleStateMap[c]
+		rctx.first = !ok
+		st.passNum = r.lifecyclePassNum
+
+		invokeRendered(c, &rctx)
+
+		r.lifecycleStateMap[c] = st
+
+	}
+
+	// now purge from lifecycleStateMap anything not touched in this pass
+	for k, st := range r.lifecycleStateMap {
+		if st.passNum != r.lifecyclePassNum {
+			delete(r.lifecycleStateMap, k)
+		}
+	}
+
+	return nil
+
+}
+
+func (r *JSRenderer) cleanupCSS(bo *vugu.BuildOut, buildResults *vugu.BuildResults) error {
 	visitCSSList := func(cssList []*vugu.VGNode) error {
-		// CSS stuff first
 		for _, cssEl := range cssList {
 
 			// some basic sanity checking
@@ -252,52 +306,7 @@ func (r *JSRenderer) render(buildResults *vugu.BuildResults) error {
 	if err != nil {
 		return err
 	}
-
-	// main output
-	err = r.visitFirst(state, bo, buildResults, bo.Out[0], []byte("0"))
-	if err != nil {
-		return err
-	}
-
-	// // JS stuff last
-	// // log.Printf("TODO: handle JS")
-
-	err = r.instructionList.flush()
-	if err != nil {
-		return err
-	}
-
-	// handle Rendered lifecycle callback
-	if r.lifecycleStateMap == nil {
-		r.lifecycleStateMap = make(map[interface{}]lifecycleState, len(bo.Components))
-	}
-	r.lifecyclePassNum++
-
-	var rctx renderedCtx
-
-	for _, c := range bo.Components {
-
-		rctx = renderedCtx{eventEnv: r.eventEnv}
-
-		st, ok := r.lifecycleStateMap[c]
-		rctx.first = !ok
-		st.passNum = r.lifecyclePassNum
-
-		invokeRendered(c, &rctx)
-
-		r.lifecycleStateMap[c] = st
-
-	}
-
-	// now purge from lifecycleStateMap anything not touched in this pass
-	for k, st := range r.lifecycleStateMap {
-		if st.passNum != r.lifecyclePassNum {
-			delete(r.lifecycleStateMap, k)
-		}
-	}
-
 	return nil
-
 }
 
 // EventWait blocks until an event has occurred which causes a re-render.
@@ -398,6 +407,20 @@ func (r *JSRenderer) visitHead(state *jsRenderState, bo *vugu.BuildOut, br *vugu
 	err = r.syncElement(state, n, positionID)
 	if err != nil {
 		return err
+	}
+
+	// Sync title, while preserving other tags
+	for nchild := n.FirstChild; nchild != nil; nchild = nchild.NextSibling {
+		if strings.ToLower(nchild.Data) == "title" {
+			err := r.instructionList.writeSelectQuery("title")
+			if err != nil {
+				return err
+			}
+			err = r.visitSyncNode(state, bo, br, nchild, []byte("title"))
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
